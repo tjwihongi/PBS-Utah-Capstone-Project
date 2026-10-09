@@ -1,0 +1,204 @@
+---
+title: "Donor Prediction: Exploratory Data Analysis"
+author: "Tama Wihongi"
+date: "10-9-2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, echo = TRUE)
+required_packages <- c("data.table", "ggplot2", "scales", "knitr")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages)) stop("Install required packages: ", paste(missing_packages, collapse = ", "))
+library(data.table)
+library(ggplot2)
+library(scales)
+library(knitr)
+options(scipen = 999)
+
+# Data files are stored directly in the Capstone 1 project folder.
+table_dir <- "C:/Users/tamaw/Desktop/Capstone 1"
+if (!dir.exists(table_dir)) stop("Capstone data folder not found: ", table_dir)
+fy_from_date <- function(x) {
+  x <- as.IDate(x)
+  as.integer(format(x, "%Y")) + ifelse(as.integer(format(x, "%m")) >= 7L, 1L, 0L)
+}
+fmt_n <- function(x) comma(round(x))
+```
+
+# Business and analytic framing
+
+PBS Utah needs to focus limited fundraising outreach on constituents who are most likely to give. The business problem is prioritization: identify prospective donors early enough to make a useful contact decision, without spending staff time/resources on people unlikely to respond.
+
+The analytic problem is a donor-level binary classification task. The **unit of analysis** is one constituent at the close of FY2025. The **target** is `target_gave_fy26`: whether that constituent has positive credited giving in FY2026. Credited giving follows the dataset convention—positive hard payments plus positive soft credits assigned to the constituent—after exact duplicate soft-credit rows are removed. The target is recognition of a donor, not revenue; soft credits must not be added to hard-payment revenue reporting.
+
+The initial framing was “predict future donors from all available constituent information.” EDA sharpens it: the constituent file has extract-date snapshot fields, such as age, sustainer status, and major-donor class, that can leak future information into historical scoring. The viable first model is consequently a **time-safe FY2025 snapshot** using prior giving and prior-year solicitation behavior, with all FY2026 activity excluded.
+
+# Exploration questions
+
+These questions determine the sections and outputs below.
+
+1.  Are the tables at the documented grain, free of key integrity problems, and usable for a donor-level panel?
+2.  How much missingness, duplication, invalid dates, and non-positive giving exists in the fields used to construct the target and key predictors?
+3.  How many FY2026 donors are there, how concentrated are their gifts, and is giving persistent year to year?
+4.  Does FY2025 giving history distinguish FY2026 donors from non-donors?
+5.  Among solicited people, does an FY2025 campaign response add useful signal beyond prior giving?
+6.  **Question added after source inspection:** can Passport engagement be evaluated, or is its apparent absence a data-delivery problem rather than no engagement?
+
+# Load data and inspect source structure
+
+```{r load-data}
+constituents <- fread(file.path(table_dir, "constituents_w_memberships.csv"))
+payments_raw <- fread(file.path(table_dir, "unite_payments.txt"))
+soft_raw <- fread(file.path(table_dir, "soft_credits.csv"))
+campaigns <- fread(file.path(table_dir, "campaign_members.txt"))
+legacy <- fread(file.path(table_dir, "team_approach_legacy_payments.txt"))
+
+passport_path <- file.path(table_dir, "passport_viewing.txt")
+passport_header <- readLines(passport_path, n = 1L, warn = FALSE)
+passport_available <- !startsWith(passport_header, "version https://git-lfs.github.com")
+
+inventory <- data.table(
+  source = c("Constituents", "Unite payments", "Soft credits", "Campaign members", "Legacy payments", "Passport viewing"),
+  rows = c(nrow(constituents), nrow(payments_raw), nrow(soft_raw), nrow(campaigns), nrow(legacy), if (passport_available) nrow(fread(passport_path)) else NA_integer_),
+  intended_grain = c("Constituent", "Payment", "Soft credit", "Solicitation", "Household gift", "Constituent-year-genre"),
+  modeling_use = c("Population only; snapshots excluded", "Giving history and target", "Giving recognition and target", "Lagged outreach behavior", "History only; do not unpivot/sum", if (passport_available) "Potential lagged feature" else "Unavailable")
+)
+kable(inventory, format = "html", caption = "Question 1: Source inventory, grain, and modeling use")
+```
+
+The inventory establishes why a direct “join everything” approach would be wrong. Payments are transaction-level, campaign members are solicitation-level, and legacy gifts are household-level. Each is aggregated to a constituent-year only when its grain supports that operation. In particular, legacy constituent columns are not unpivoted because a household gift could then be counted multiple times.
+
+# Data quality: missingness, anomalies, and decisions
+
+```{r quality-checks}
+payments <- copy(payments_raw)
+payments[, credit_date := as.IDate(credit_date)]
+payments[, fiscal_year := fy_from_date(credit_date)]
+soft <- unique(copy(soft_raw))
+soft[, credit_date := as.IDate(`Credit Date`)]
+soft[, fiscal_year := fy_from_date(credit_date)]
+
+key_missingness <- rbindlist(list(
+  data.table(source = "Payments", variable = "donor_id", missing = sum(is.na(payments$donor_id) | payments$donor_id == ""), total = nrow(payments)),
+  data.table(source = "Payments", variable = "credit_date", missing = sum(is.na(payments$credit_date)), total = nrow(payments)),
+  data.table(source = "Payments", variable = "payment_amount", missing = sum(is.na(payments$payment_amount)), total = nrow(payments)),
+  data.table(source = "Soft credits", variable = "recipient ID", missing = sum(is.na(soft$`Soft Credit Constituent ID`) | soft$`Soft Credit Constituent ID` == ""), total = nrow(soft)),
+  data.table(source = "Soft credits", variable = "credit date", missing = sum(is.na(soft$credit_date)), total = nrow(soft)),
+  data.table(source = "Campaigns", variable = "constituent_id", missing = sum(is.na(campaigns$constituent_id) | campaigns$constituent_id == ""), total = nrow(campaigns)),
+  data.table(source = "Campaigns", variable = "responded", missing = sum(is.na(campaigns$responded)), total = nrow(campaigns))
+))
+key_missingness[, missing_pct := missing / total]
+kable(key_missingness[, .(source, variable, missing, missing_pct = percent(missing_pct, accuracy = .01))], format = "html", caption = "Question 2: Missingness in target and predictor construction fields")
+
+quality <- data.table(
+  check = c("Duplicate payment rows", "Duplicate soft-credit rows removed", "Non-positive payments", "Non-positive soft credits", "Payment IDs not in constituents", "Matched soft-credit IDs not in constituents", "Orphan soft credits", "Invalid payment dates", "Invalid soft-credit dates"),
+  count = c(nrow(payments_raw) - nrow(unique(payments_raw)), nrow(soft_raw) - nrow(soft), sum(payments$payment_amount <= 0, na.rm = TRUE), sum(soft$`Credit Amount` <= 0, na.rm = TRUE), sum(!payments$donor_id %in% constituents[["Constituent ID"]]), sum(!soft$`Soft Credit Constituent ID` %in% constituents[["Constituent ID"]] & soft$`Soft Credit Constituent ID` != "SYN-ORPHAN"), sum(soft$`Soft Credit Constituent ID` == "SYN-ORPHAN"), sum(is.na(payments$credit_date)), sum(is.na(soft$credit_date))
+))
+kable(quality, format = "html", caption = "Question 2: Anomaly and referential-integrity checks")
+```
+
+The modeling treatment follows from these checks. Exact duplicate soft-credit rows are removed before aggregation because retaining them would inflate a person’s label and predictors. `SYN-ORPHAN` soft credits are excluded because they cannot be attached to a modeling row. Non-positive amounts are retained in the audit but excluded from the positive-giving label; they may be reversals rather than evidence of donor intent. Missing campaign response is kept as its own “unknown” state if it occurs, rather than assumed to be no response. No model will impute an identifier or a transaction date: a record missing either is unsuitable for the relevant aggregate.
+
+The added Passport question is material: `r if (passport_available) "the Passport file is available for analysis." else "the repository contains a Git-LFS pointer instead of Passport data, so no engagement feature can be evaluated yet."` This is a data-delivery issue, not zero viewing; the first model must omit Passport variables until the actual file is obtained.
+
+# Question 3: annual giving and target prevalence
+
+```{r annual-giving}
+hard_fy <- payments[payment_amount > 0, .(hard_amount = sum(payment_amount), hard_payments = .N), by = .(constituent_id = donor_id, fiscal_year)]
+soft_fy <- soft[`Credit Amount` > 0 & `Soft Credit Constituent ID` != "SYN-ORPHAN", .(soft_amount = sum(`Credit Amount`), soft_credits = .N), by = .(constituent_id = `Soft Credit Constituent ID`, fiscal_year)]
+giving_fy <- merge(hard_fy, soft_fy, by = c("constituent_id", "fiscal_year"), all = TRUE)
+for (v in c("hard_amount", "hard_payments", "soft_amount", "soft_credits")) set(giving_fy, which(is.na(giving_fy[[v]])), v, 0)
+giving_fy[, credited_amount := hard_amount + soft_amount]
+
+annual <- giving_fy[, .(recognized_donors = uniqueN(constituent_id), credited_giving = sum(credited_amount), median_gift = as.numeric(median(credited_amount)), p90_gift = as.numeric(quantile(credited_amount, .90)), soft_credit_share = sum(soft_amount) / sum(credited_amount)), by = fiscal_year][order(fiscal_year)]
+kable(annual, digits = 2, format = "html", caption = "Question 3: Annual credited giving")
+```
+
+```{r annual-donors-plot, fig.width=8, fig.height=4}
+ggplot(annual, aes(factor(fiscal_year), recognized_donors)) +
+  geom_col(fill = "#256D85") +
+  scale_y_continuous(labels = comma) +
+  labs(title = "Recognized donors by fiscal year", x = "Fiscal year", y = "Number of recognized donors") +
+  theme_minimal(base_size = 12)
+```
+
+FY2026 contains `r fmt_n(annual[fiscal_year == 2026, recognized_donors])` recognized donors. Its median credited annual giving is `r dollar(annual[fiscal_year == 2026, median_gift])`, while the 90th percentile is `r dollar(annual[fiscal_year == 2026, p90_gift])`. That gap is the practical reason to model donor propensity separately from gift amount: a few large gifts should not dominate a first-contact ranking model.
+
+# Questions 4–5: a time-safe donor-level modeling panel
+
+```{r modeling-panel}
+target_fy <- 2026L
+feature_fy <- 2025L
+panel <- data.table(constituent_id = constituents[["Constituent ID"]])
+
+recent <- dcast(giving_fy[fiscal_year %in% c(2024L, 2025L)], constituent_id ~ fiscal_year, value.var = "credited_amount", fill = 0)
+setnames(recent, c("2024", "2025"), c("giving_fy24", "giving_fy25"))
+panel <- merge(panel, recent, by = "constituent_id", all.x = TRUE)
+panel[is.na(giving_fy24), giving_fy24 := 0]
+panel[is.na(giving_fy25), giving_fy25 := 0]
+
+target <- giving_fy[fiscal_year == target_fy, .(target_gave_fy26 = as.integer(sum(credited_amount) > 0), target_amount_fy26 = sum(credited_amount)), by = constituent_id]
+panel <- merge(panel, target, by = "constituent_id", all.x = TRUE)
+panel[is.na(target_gave_fy26), `:=`(target_gave_fy26 = 0L, target_amount_fy26 = 0)]
+
+campaigns[, campaign_start_date := as.IDate(campaign_start_date)]
+campaigns[, fiscal_year := fy_from_date(campaign_start_date)]
+campaign_25 <- campaigns[fiscal_year == feature_fy, .(solicitations_fy25 = .N, campaign_response_fy25 = as.integer(any(responded %in% TRUE))), by = constituent_id]
+panel <- merge(panel, campaign_25, by = "constituent_id", all.x = TRUE)
+panel[is.na(solicitations_fy25), `:=`(solicitations_fy25 = 0L, campaign_response_fy25 = 0L)]
+panel[, prior_donor_fy25 := as.integer(giving_fy25 > 0)]
+panel[, two_year_donor := as.integer(giving_fy24 > 0 & giving_fy25 > 0)]
+
+target_summary <- panel[, .(constituents = .N, FY2026_donor_rate = mean(target_gave_fy26), FY2025_donor_rate = mean(prior_donor_fy25))]
+kable(target_summary[, lapply(.SD, function(x) if (is.numeric(x)) x else x)], digits = 3, format = "html", caption = "Modeling population and target prevalence")
+
+rates <- rbindlist(list(
+  panel[, .(FY2026_donor_rate = mean(target_gave_fy26)),
+        by = .(predictor = rep("Gave in FY2025", length(prior_donor_fy25)), group = ifelse(prior_donor_fy25 == 1, "Yes", "No"))],
+  panel[, .(FY2026_donor_rate = mean(target_gave_fy26)),
+        by = .(predictor = rep("Responded to an FY2025 campaign", length(campaign_response_fy25)), group = ifelse(campaign_response_fy25 == 1, "Yes", "No"))]
+))
+kable(rates, digits = 3, format = "html", caption = "Questions 4–5: FY2026 donor rate by plausible FY2025 predictors")
+```
+
+```{r target-predictor-plot, fig.width=8, fig.height=4}
+ggplot(rates, aes(group, FY2026_donor_rate, fill = predictor)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Future donor rate by prior giving and campaign response", x = "FY2025 predictor group", y = "FY2026 donor rate", fill = "Predictor") +
+  theme_minimal(base_size = 12)
+```
+
+The FY2026 donor rate is `r percent(target_summary$FY2026_donor_rate, accuracy = .1)`, so a model that predicts “no donor” for everyone could appear accurate while providing no outreach value. The observed FY2026 rate is `r percent(rates[predictor == "Gave in FY2025" & group == "Yes", FY2026_donor_rate], accuracy = .1)` for FY2025 donors versus `r percent(rates[predictor == "Gave in FY2025" & group == "No", FY2026_donor_rate], accuracy = .1)` for non-donors. Recent giving is therefore the baseline feature a more complex model must improve upon.
+
+Campaign-response differences should be interpreted as association, not causal campaign lift: responses and later giving may both reflect an underlying propensity to donate. The response feature is usable only when scoring after the FY2025 campaign response window; it is not a valid feature for a model that must score before a campaign closes.
+
+# Results and implications for modeling
+
+The EDA changes the modeling plan in four concrete ways.
+
+1.  The model will use a constituent-year panel and a time-based evaluation split, not a random transaction-row split. This prevents the same donor’s history from leaking across train and test data.
+2.  Positive hard payments and deduplicated, matched soft credits define the donor-recognition target. Orphan recipients and duplicate soft credits are excluded; non-positive amounts do not create a donor label.
+3.  Lagged giving and lagged campaign behavior are the first feature set because they are available at the scoring cutoff and have direct bivariate comparisons with the target. Snapshot constituent fields—including age, sustainer status, and major-donor class—are excluded unless historical versions are supplied.
+4.  Passport engagement is deferred because its source file is unavailable. Its absence must never be converted into a “no engagement” value without first resolving whether it reflects no account, no consent, no viewing, or a missing extract.
+
+The next modeling notebook should begin with a logistic-regression baseline using these lagged features, then compare a tree-based model. It should report PR AUC, ROC AUC, calibration, and lift/precision at the staff-contact capacity—not accuracy alone. Household-aware or donor-level time splits are required, and spouses should stay together wherever household information supports that rule.
+
+# Reproducibility and AI use
+
+## Reproducibility
+
+The data were cloned from the team GitHub repository into `donor_prediction_capstone_project`. This notebook reads those paths directly, loads each source once, performs all cleaning and aggregation in code, and can be rendered from a clean R session after installing the packages listed in the setup chunk. Large files are read with `data.table::fread`; no Excel truncation or manual spreadsheet edits are used. The GitHub repository should contain this `.Rmd` and the rendered HTML, while raw data remain governed by the repository’s tracking rules.
+
+## AI use note
+
+ChatGPT Codex was used to inspect the repository documentation and file schemas, draft reproducible R code, identify grain/join and leakage risks, and structure the notebook around explicit questions. Its output was verified against the repository’s data dictionary, raw CSV headers, and the computed tables produced by this notebook. The author reviewed the target definition, data-quality decisions, and interpretations; AI suggestions were not treated as evidence without a corresponding calculation or source check.
+
+## Individual contribution
+
+This is Tama Wihongi's individual EDA contribution. The code, tables, plots, data-quality decisions, and written interpretations in this notebook were independently produced for inclusion in the group project and later GitHub portfolio.
