@@ -7,9 +7,14 @@ This repository contains Tama Wihongi's individual exploratory data analysis (ED
 - `PBS_Utah_EDA_Corrected.Rmd` — reproducible R Markdown source with code shown.
 - `PBS_Utah_EDA_Corrected.html` — rendered HTML notebook for review or submission.
 
+- `PBS_Utah_Decision_Tree_Modeling.qmd` — Quarto source comparing logistic regression and a tuned decision tree with chronological validation.
+- `PBS_Utah_Decision_Tree_Modeling.html` — rendered HTML modeling report for review or submission.
+
 ## Project question
 
 The analysis investigates how PBS Utah can identify constituents who are most likely to make a major gift. It examines data quality, historical giving, recency and frequency, solicitation response, and potential leakage before model building.
+
+The modeling report evaluates a logistic-regression benchmark against a tuned decision tree for ranking future major-donor prospects.
 
 ## Data
 
@@ -25,6 +30,8 @@ data/
 └── passport_viewing.txt
 ```
 
+The decision-tree report reads the prebuilt analytic panel at `data/donor_panel_time_safe.csv`. This derived file is excluded from the repository because it is based on the authorized project data.
+
 ## Reproducing the analysis
 
 1. Open `PBS_Utah_EDA_Corrected.Rmd` in RStudio or Positron.
@@ -36,6 +43,8 @@ data/
 
 3. Place the authorized data in `data/`, or set the `data_dir` parameter to its location.
 4. Render the notebook to regenerate the HTML output.
+
+To reproduce the decision-tree report, install Quarto and the R packages listed in its setup chunk, place `donor_panel_time_safe.csv` in `data/`, then render `PBS_Utah_Decision_Tree_Modeling.qmd`.
 
 ## AI use
 

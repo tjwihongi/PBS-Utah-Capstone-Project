@@ -1,0 +1,472 @@
+---
+title: "PBS Utah Major-Donor Modeling: Logistic Regression vs. Decision Tree"
+author: "Tama Wihongi"
+date: last-modified
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: false
+    code-tools: true
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+required_packages <- c(
+  "tidyverse", "tidymodels", "rpart", "rpart.plot", "knitr", "scales"
+)
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages) > 0) {
+  stop("Install these packages before rendering: ",
+       paste(missing_packages, collapse = ", "))
+}
+
+library(tidyverse)
+library(tidymodels)
+library(rpart)
+library(rpart.plot)
+library(knitr)
+library(scales)
+
+tidymodels_prefer()
+set.seed(123)
+options(dplyr.summarise.inform = FALSE)
+major_cutoff <- 1200
+final_test_year <- 2025
+```
+
+# Introduction
+
+PBS Utah needs a repeatable way to identify constituents who may move into its major-gift program, allowing limited prospect-research and cultivation resources to focus on the most promising people. PBS Utah defines a major donor as someone who gives at least $1,200 annually. Model scores are intended to support, not replace, professional fundraising judgment.
+
+The unit of analysis is a **constituent-feature-year**. Eligible constituents gave less than $`r comma(major_cutoff)` in the feature year, and the binary target, `major_donor_next_fy`, indicates whether they reached at least $`r comma(major_cutoff)` in recognized giving during the following fiscal year. This notebook compares benchmark logistic regression with a tuned decision tree using the same predictors and chronological validation folds. The $2,000–$15,000 range remains a secondary business-prioritization segment rather than the modeling target.
+
+# Data preparation
+
+## Load and validate the shared panel
+
+The group panel contains one row per constituent-feature-year and was constructed from the authorized donation, soft-credit, campaign, Passport, membership, and legacy-gift files. Predictors were restricted to information available by the end of each feature year. Raw-file ingestion and panel construction are maintained separately so this notebook remains focused on the assigned model comparison.
+
+```{r}
+#| label: load-panel
+
+panel_path <- "data/donor_panel_time_safe.csv"
+if (!file.exists(panel_path)) {
+  stop(
+    "Shared analytic panel not found at '", panel_path,
+    "'. Create or copy donor_panel_time_safe.csv into the data folder."
+  )
+}
+
+donor_panel <- readr::read_csv(panel_path, show_col_types = FALSE)
+required_columns <- c(
+  "constituent_id", "feature_fy", "outcome_fy",
+  "current_recognized_amount", "donated_current_fy",
+  "cumulative_recognized_amount", "active_giving_years",
+  "years_since_last_gift", "legacy_household_gift_links",
+  "cumulative_solicitation_count", "cumulative_response_count",
+  "observed_passport", "titles_viewed", "recognized_amount_next_fy"
+)
+missing_columns <- setdiff(required_columns, names(donor_panel))
+if (length(missing_columns) > 0) {
+  stop("Panel is missing: ", paste(missing_columns, collapse = ", "))
+}
+```
+
+## Target and eligible population
+
+```{r}
+#| label: target-and-eligibility
+
+model_panel <- donor_panel |>
+  mutate(
+    current_recognized_amount = coalesce(current_recognized_amount, 0),
+    recognized_amount_next_fy = coalesce(recognized_amount_next_fy, 0),
+    major_donor_next_fy = factor(
+      if_else(recognized_amount_next_fy >= major_cutoff,
+              "major_donor", "not_major_donor"),
+      levels = c("major_donor", "not_major_donor")
+    ),
+    in_2000_15000_next_fy = between(recognized_amount_next_fy, 2000, 15000)
+  ) |>
+  filter(current_recognized_amount < major_cutoff)
+
+include_non_donors <- TRUE
+
+if (!include_non_donors) {
+  model_panel <- model_panel |> filter(current_recognized_amount > 0)
+}
+if (model_panel |> count(constituent_id, feature_fy) |> filter(n != 1) |> nrow() > 0) {
+  stop("Panel does not have one row per constituent-feature-year.")
+}
+if (model_panel |> filter(is.na(outcome_fy) | outcome_fy != feature_fy + 1) |> nrow() > 0) {
+  stop("Some outcomes are not exactly one fiscal year after their features.")
+}
+
+target_by_year <- model_panel |>
+  group_by(feature_fy, outcome_fy) |>
+  summarise(
+    eligible_n = n(),
+    new_major_donors = sum(major_donor_next_fy == "major_donor"),
+    target_rate = mean(major_donor_next_fy == "major_donor"),
+    .groups = "drop"
+  )
+kable(
+  target_by_year |> mutate(target_rate = percent(target_rate, accuracy = 0.001)),
+  caption = "Major-donor outcome prevalence by prediction period"
+)
+```
+
+The default population includes all constituents below $1,200, including current non-donors. Because transitions are rare, PR AUC and top-of-list lift are more informative than classification accuracy.
+
+## Feature engineering
+
+Both algorithms receive identical baseline features. Skewed amounts and counts use `log1p()` transformations, recency is grouped to allow a nonlinear relationship, and missing Passport observation remains distinct from zero viewing.
+
+```{r}
+#| label: feature-engineering
+
+model_data <- model_panel |>
+  mutate(
+    recency_band = case_when(
+      is.na(years_since_last_gift) | years_since_last_gift > 100 ~
+        "No observed prior gift",
+      years_since_last_gift <= 0 ~ "Gave this fiscal year",
+      years_since_last_gift == 1 ~ "1 year since last gift",
+      TRUE ~ "2+ years since last gift"
+    ),
+    recency_band = factor(recency_band),
+    log_current_recognized_amount = log1p(current_recognized_amount),
+    log_cumulative_recognized_amount =
+      log1p(coalesce(cumulative_recognized_amount, 0)),
+    log_legacy_household_links =
+      log1p(coalesce(legacy_household_gift_links, 0)),
+    log_cumulative_solicitations =
+      log1p(coalesce(cumulative_solicitation_count, 0)),
+    had_solicitation = as.integer(
+      coalesce(cumulative_solicitation_count, 0) > 0
+    ),
+    response_rate = if_else(
+      coalesce(cumulative_solicitation_count, 0) > 0,
+      coalesce(cumulative_response_count, 0) / cumulative_solicitation_count,
+      0
+    ),
+    observed_passport = factor(
+      if_else(coalesce(observed_passport, 0) == 1, "Observed", "Not observed")
+    ),
+    log_titles_viewed = log1p(coalesce(titles_viewed, 0)),
+    active_giving_years = coalesce(active_giving_years, 0)
+  )
+
+baseline_features <- c(
+  "log_current_recognized_amount", "donated_current_fy",
+  "log_cumulative_recognized_amount", "active_giving_years",
+  "recency_band", "log_legacy_household_links",
+  "log_cumulative_solicitations", "had_solicitation",
+  "response_rate", "observed_passport", "log_titles_viewed"
+)
+model_data <- model_data |>
+  select(
+    constituent_id, feature_fy, outcome_fy, major_donor_next_fy,
+    in_2000_15000_next_fy, all_of(baseline_features)
+  )
+```
+
+Outcome-year giving and snapshot variables whose historical values cannot be reconstructed are excluded to prevent leakage. Cumulative recognized giving is used instead of entering redundant direct, soft-credit, and recognized totals together.
+
+# Chronological validation
+
+FY2025 features predicting FY2026 are reserved for the group's final test. Development uses expanding-window validation, ensuring every assessment year occurs after its training years.
+
+```{r}
+#| label: chronological-splits
+
+development_data <- model_data |> filter(feature_fy < final_test_year)
+final_test_data <- model_data |> filter(feature_fy == final_test_year)
+validation_years <- sort(unique(development_data$feature_fy))[-1]
+
+chronological_splits <- map(validation_years, function(validation_year) {
+  rsample::make_splits(
+    list(
+      analysis = which(development_data$feature_fy < validation_year),
+      assessment = which(development_data$feature_fy == validation_year)
+    ),
+    development_data
+  )
+})
+chronological_folds <- rsample::manual_rset(
+  chronological_splits,
+  ids = paste0("Validate_FY", validation_years)
+)
+split_summary <- tibble(
+  fold = chronological_folds$id,
+  training_years = map_chr(
+    chronological_folds$splits,
+    ~ paste(range(analysis(.x)$feature_fy), collapse = "–")
+  ),
+  validation_year = map_int(
+    chronological_folds$splits,
+    ~ unique(assessment(.x)$feature_fy)
+  ),
+  training_rows = map_int(chronological_folds$splits, ~ nrow(analysis(.x))),
+  validation_rows = map_int(chronological_folds$splits, ~ nrow(assessment(.x)))
+)
+kable(split_summary, caption = "Expanding-window development folds")
+```
+
+# Modeling process
+
+## Shared recipe and metrics
+
+```{r}
+#| label: model-setup
+
+baseline_formula <- reformulate(
+  baseline_features,
+  response = "major_donor_next_fy"
+)
+common_recipe <- recipe(baseline_formula, data = development_data) |>
+  step_unknown(all_nominal_predictors(), new_level = ".missing") |>
+  step_novel(all_nominal_predictors(), new_level = ".new") |>
+  step_impute_median(all_numeric_predictors()) |>
+  step_zv(all_predictors())
+
+model_metrics <- metric_set(pr_auc, roc_auc, brier_class, mn_log_loss)
+resample_control <- control_resamples(save_pred = TRUE, verbose = FALSE)
+tune_control <- control_grid(save_pred = TRUE, verbose = FALSE)
+```
+
+PR AUC is the primary selection metric because future major-donor transitions are rare. ROC AUC, Brier score, and log loss provide complementary information about discrimination and probability quality.
+
+## Benchmark logistic regression
+
+```{r}
+#| label: logistic-benchmark
+
+logistic_workflow <- workflow() |>
+  add_recipe(common_recipe) |>
+  add_model(logistic_reg(mode = "classification") |> set_engine("glm"))
+
+logistic_runtime <- system.time({
+  logistic_results <- fit_resamples(
+    logistic_workflow,
+    resamples = chronological_folds,
+    metrics = model_metrics,
+    control = resample_control
+  )
+})[["elapsed"]]
+logistic_cv_metrics <- collect_metrics(logistic_results) |>
+  mutate(model = "Logistic regression")
+```
+
+Logistic regression is an interpretable benchmark, but its linear log-odds structure may miss thresholds and interactions among recency, engagement, and giving history.
+
+## Tuned decision tree
+
+```{r}
+#| label: decision-tree-tuning
+
+tree_spec <- decision_tree(
+  mode = "classification",
+  cost_complexity = tune(),
+  tree_depth = tune(),
+  min_n = tune()
+) |>
+  set_engine("rpart")
+tree_workflow <- workflow() |>
+  add_recipe(common_recipe) |>
+  add_model(tree_spec)
+tree_grid <- dials::grid_latin_hypercube(
+  dials::cost_complexity(range = c(-6, -1)),
+  dials::tree_depth(range = c(2L, 12L)),
+  dials::min_n(range = c(20L, 1000L)),
+  size = 30
+)
+
+tree_runtime <- system.time({
+  tree_tuning_results <- tune_grid(
+    tree_workflow,
+    resamples = chronological_folds,
+    grid = tree_grid,
+    metrics = model_metrics,
+    control = tune_control
+  )
+})[["elapsed"]]
+best_tree_parameters <- select_best(tree_tuning_results, metric = "pr_auc")
+best_tree_workflow <- finalize_workflow(tree_workflow, best_tree_parameters)
+best_tree_cv_metrics <- collect_metrics(tree_tuning_results) |>
+  semi_join(best_tree_parameters, by = names(best_tree_parameters)) |>
+  mutate(model = "Decision tree")
+kable(
+  best_tree_parameters,
+  digits = 5,
+  caption = "Decision-tree parameters selected by development PR AUC"
+)
+```
+
+All tuning occurs inside the development period; the reserved final year does not influence model selection.
+
+# Model performance
+
+## Cross-validated metrics
+
+```{r}
+#| label: cv-comparison
+
+cv_comparison <- bind_rows(logistic_cv_metrics, best_tree_cv_metrics) |>
+  select(model, .metric, mean, std_err) |>
+  arrange(.metric, desc(mean))
+kable(
+  cv_comparison,
+  digits = 4,
+  caption = "Chronological out-of-sample performance"
+)
+```
+
+## Top-ranked prospects
+
+```{r}
+#| label: top-k-comparison
+
+top_k_summary <- function(predictions, model_name, k = 500) {
+  predictions |>
+    group_by(id) |>
+    arrange(desc(.pred_major_donor), .by_group = TRUE) |>
+    mutate(
+      actual_major = major_donor_next_fy == "major_donor",
+      fold_prevalence = mean(actual_major),
+      rank = row_number()
+    ) |>
+    filter(rank <= min(k, n())) |>
+    summarise(
+      model = model_name,
+      reviewed = n(),
+      major_donors_found = sum(actual_major),
+      precision_at_k = mean(actual_major),
+      lift_at_k = precision_at_k / first(fold_prevalence),
+      .groups = "drop"
+    )
+}
+
+logistic_predictions <- collect_predictions(logistic_results)
+best_tree_config <- best_tree_cv_metrics$.config[1]
+tree_predictions <- collect_predictions(tree_tuning_results) |>
+  filter(.config == best_tree_config)
+top_k_results <- bind_rows(
+  top_k_summary(logistic_predictions, "Logistic regression"),
+  top_k_summary(tree_predictions, "Decision tree")
+)
+kable(
+  top_k_results |>
+    mutate(
+      precision_at_k = percent(precision_at_k, accuracy = 0.01),
+      lift_at_k = number(lift_at_k, accuracy = 0.01)
+    ),
+  caption = paste0("Performance among the top ", comma(500),
+                   " scores in each fold")
+)
+```
+
+Top-$K$ precision and lift connect performance to the number of prospects PBS Utah can realistically review.
+
+## Runtime and in-sample performance
+
+```{r}
+#| label: runtime-and-training-performance
+
+runtime_table <- tibble(
+  model_process = c("Logistic resampling", "Decision-tree tuning"),
+  elapsed_seconds = c(logistic_runtime, tree_runtime)
+)
+selected_tree_fit <- fit(best_tree_workflow, data = development_data)
+tree_training_predictions <- bind_cols(
+  development_data |> select(major_donor_next_fy),
+  predict(selected_tree_fit, development_data, type = "prob")
+)
+tree_training_metrics <- model_metrics(
+  tree_training_predictions,
+  truth = major_donor_next_fy,
+  .pred_major_donor
+)
+kable(runtime_table, digits = 2, caption = "Development runtime")
+kable(
+  tree_training_metrics,
+  digits = 4,
+  caption = "Selected tree: in-sample development performance"
+)
+```
+
+Training metrics describe fit rather than expected future performance. Chronological validation is the appropriate basis for comparing algorithms.
+
+## Selected tree
+
+```{r}
+#| label: selected-tree-plot
+#| fig-width: 11
+#| fig-height: 7
+
+selected_rpart <- extract_fit_parsnip(selected_tree_fit)$fit
+rpart.plot(
+  selected_rpart,
+  type = 2,
+  extra = 104,
+  fallen.leaves = TRUE,
+  tweak = 0.8,
+  main = "Selected decision tree fitted to development years"
+)
+```
+
+Split variables are predictive signals, not evidence that they cause increased giving.
+
+# Results and business implications
+
+```{r}
+#| label: results-values
+#| include: false
+
+logistic_pr <- cv_comparison |>
+  filter(model == "Logistic regression", .metric == "pr_auc") |>
+  pull(mean)
+tree_pr <- cv_comparison |>
+  filter(model == "Decision tree", .metric == "pr_auc") |>
+  pull(mean)
+logistic_top_found <- top_k_results |>
+  filter(model == "Logistic regression") |>
+  summarise(total = sum(major_donors_found)) |>
+  pull(total)
+tree_top_found <- top_k_results |>
+  filter(model == "Decision tree") |>
+  summarise(total = sum(major_donors_found)) |>
+  pull(total)
+```
+
+The logistic benchmark achieved a mean chronological PR AUC of `r number(logistic_pr, accuracy = 0.001)`, compared with `r number(tree_pr, accuracy = 0.001)` for the tuned decision tree. `r if (tree_pr > logistic_pr) "The tree improved the primary development metric, suggesting that nonlinear splits and interactions added useful ranking information." else "The tree did not improve the primary development metric, so the simpler logistic benchmark is preferable."`
+
+Across the development folds, the top `r comma(500)` logistic scores identified `r comma(logistic_top_found)` future major donors, while the tree identified `r comma(tree_top_found)`. These results are useful only if PBS Utah can review a similarly sized prospect list. The tree should advance to the group model only when its improvement is meaningful across folds and is not explained by substantially worse probability calibration or overfitting.
+
+Model scores should remain decision-support inputs. PBS Utah staff retain responsibility for prospect qualification, cultivation, contact decisions, and solicitation amounts. The FY2025-to-FY2026 period remains reserved for the group's one-time final evaluation and is not evaluated in this individual notebook.
+
+No Kaggle score is reported for this individual comparison because model development uses the shared chronological folds and the final test period remains reserved for the group evaluation.
+
+## Limitations
+
+- Major-donor transitions are rare, so fold-level estimates may be unstable.
+- Recognized giving includes soft-credit recognition and is not identical to cash revenue.
+- Engagement and campaign relationships are predictive, not causal, and require sponsor validation before operational use.
+
+# Contribution
+
+**Tama Wihongi:** Evaluated the decision tree as an alternative algorithm; tuned its complexity with expanding-window validation; and compared it with logistic regression using the same target, population, predictors, folds, and metrics. The comparison included ranking performance, runtime, overfitting, and business implications.
+
+# AI use note
+
+I used ChatGPT Codex to help organize the Quarto notebook, troubleshoot R code, and develop the chronological validation and decision-tree tuning workflow. I verified the target and split definitions against the project requirements and independently checked the main outcome counts and model comparisons using the source data.
