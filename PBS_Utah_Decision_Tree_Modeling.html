@@ -3005,11 +3005,11 @@ window.Quarto = {
 <tbody>
 <tr class="odd">
 <td style="text-align: left;">Logistic resampling</td>
-<td style="text-align: right;">16.13</td>
+<td style="text-align: right;">19.75</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Decision-tree tuning</td>
-<td style="text-align: right;">85.86</td>
+<td style="text-align: right;">92.64</td>
 </tr>
 </tbody>
 </table>
@@ -3084,7 +3084,6 @@ window.Quarto = {
 <p>The logistic benchmark achieved a mean chronological PR AUC of 0.128, compared with 0.500 for the tuned decision tree. The tree improved the primary development metric, suggesting that nonlinear splits and interactions added useful ranking information.</p>
 <p>Across the development folds, the top 500 logistic scores identified 82 future major donors, while the tree identified 0. These results are useful only if PBS Utah can review a similarly sized prospect list. The tree should advance to the group model only when its improvement is meaningful across folds and is not explained by substantially worse probability calibration or overfitting.</p>
 <p>Model scores should remain decision-support inputs. PBS Utah staff retain responsibility for prospect qualification, cultivation, contact decisions, and solicitation amounts. The FY2025-to-FY2026 period remains reserved for the group’s one-time final evaluation and is not evaluated in this individual notebook.</p>
-<p>No Kaggle score is reported for this individual comparison because model development uses the shared chronological folds and the final test period remains reserved for the group evaluation.</p>
 <section id="limitations" class="level2">
 <h2 class="anchored" data-anchor-id="limitations">Limitations</h2>
 <ul>
@@ -4091,21 +4090,19 @@ window.Quarto = {
 <span id="cb13-481"><a href="#cb13-481" aria-hidden="true" tabindex="-1"></a></span>
 <span id="cb13-482"><a href="#cb13-482" aria-hidden="true" tabindex="-1"></a>Model scores should remain decision-support inputs. PBS Utah staff retain responsibility for prospect qualification, cultivation, contact decisions, and solicitation amounts. The FY2025-to-FY2026 period remains reserved for the group&#39;s one-time final evaluation and is not evaluated in this individual notebook.</span>
 <span id="cb13-483"><a href="#cb13-483" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-484"><a href="#cb13-484" aria-hidden="true" tabindex="-1"></a>No Kaggle score is reported for this individual comparison because model development uses the shared chronological folds and the final test period remains reserved for the group evaluation.</span>
+<span id="cb13-484"><a href="#cb13-484" aria-hidden="true" tabindex="-1"></a><span class="fu">## Limitations</span></span>
 <span id="cb13-485"><a href="#cb13-485" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-486"><a href="#cb13-486" aria-hidden="true" tabindex="-1"></a><span class="fu">## Limitations</span></span>
-<span id="cb13-487"><a href="#cb13-487" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-488"><a href="#cb13-488" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Major-donor transitions are rare, so fold-level estimates may be unstable.</span>
-<span id="cb13-489"><a href="#cb13-489" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Recognized giving includes soft-credit recognition and is not identical to cash revenue.</span>
-<span id="cb13-490"><a href="#cb13-490" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Engagement and campaign relationships are predictive, not causal, and require sponsor validation before operational use.</span>
+<span id="cb13-486"><a href="#cb13-486" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Major-donor transitions are rare, so fold-level estimates may be unstable.</span>
+<span id="cb13-487"><a href="#cb13-487" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Recognized giving includes soft-credit recognition and is not identical to cash revenue.</span>
+<span id="cb13-488"><a href="#cb13-488" aria-hidden="true" tabindex="-1"></a><span class="ss">- </span>Engagement and campaign relationships are predictive, not causal, and require sponsor validation before operational use.</span>
+<span id="cb13-489"><a href="#cb13-489" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb13-490"><a href="#cb13-490" aria-hidden="true" tabindex="-1"></a><span class="fu"># Contribution</span></span>
 <span id="cb13-491"><a href="#cb13-491" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-492"><a href="#cb13-492" aria-hidden="true" tabindex="-1"></a><span class="fu"># Contribution</span></span>
+<span id="cb13-492"><a href="#cb13-492" aria-hidden="true" tabindex="-1"></a>**Tama Wihongi:** Evaluated the decision tree as an alternative algorithm; tuned its complexity with expanding-window validation; and compared it with logistic regression using the same target, population, predictors, folds, and metrics. The comparison included ranking performance, runtime, overfitting, and business implications.</span>
 <span id="cb13-493"><a href="#cb13-493" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-494"><a href="#cb13-494" aria-hidden="true" tabindex="-1"></a>**Tama Wihongi:** Evaluated the decision tree as an alternative algorithm; tuned its complexity with expanding-window validation; and compared it with logistic regression using the same target, population, predictors, folds, and metrics. The comparison included ranking performance, runtime, overfitting, and business implications.</span>
+<span id="cb13-494"><a href="#cb13-494" aria-hidden="true" tabindex="-1"></a><span class="fu"># AI use note</span></span>
 <span id="cb13-495"><a href="#cb13-495" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-496"><a href="#cb13-496" aria-hidden="true" tabindex="-1"></a><span class="fu"># AI use note</span></span>
-<span id="cb13-497"><a href="#cb13-497" aria-hidden="true" tabindex="-1"></a></span>
-<span id="cb13-498"><a href="#cb13-498" aria-hidden="true" tabindex="-1"></a>I used ChatGPT Codex to help organize the Quarto notebook, troubleshoot R code, and develop the chronological validation and decision-tree tuning workflow. I verified the target and split definitions against the project requirements and independently checked the main outcome counts and model comparisons using the source data.</span>
+<span id="cb13-496"><a href="#cb13-496" aria-hidden="true" tabindex="-1"></a>I used ChatGPT Codex to help organize the Quarto notebook, troubleshoot R code, and develop the chronological validation and decision-tree tuning workflow. I verified the target and split definitions against the project requirements and independently checked the main outcome counts and model comparisons using the source data.</span>
 </code></pre></div><button title="Copy to Clipboard" class="code-copy-button" data-in-quarto-modal><i class="bi"></i></button></div>
 </div></div></div></div></div>
 </div> <!-- /content -->

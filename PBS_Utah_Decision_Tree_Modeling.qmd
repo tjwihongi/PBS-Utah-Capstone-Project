@@ -455,8 +455,6 @@ Across the development folds, the top `r comma(500)` logistic scores identified 
 
 Model scores should remain decision-support inputs. PBS Utah staff retain responsibility for prospect qualification, cultivation, contact decisions, and solicitation amounts. The FY2025-to-FY2026 period remains reserved for the group's one-time final evaluation and is not evaluated in this individual notebook.
 
-No Kaggle score is reported for this individual comparison because model development uses the shared chronological folds and the final test period remains reserved for the group evaluation.
-
 ## Limitations
 
 - Major-donor transitions are rare, so fold-level estimates may be unstable.
