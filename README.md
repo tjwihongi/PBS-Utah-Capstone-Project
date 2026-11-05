@@ -1,6 +1,6 @@
-# PBS Utah Major-Gift Prospecting: Individual EDA
+# PBS Utah Major-Gift Prospecting: EDA and Predictive Modeling
 
-This repository contains Tama Wihongi's individual exploratory data analysis (EDA) contribution for the PBS Utah major-gift prospecting capstone project.
+This repository contains Tama Wihongi's individual exploratory data analysis (EDA) and predictive-modeling contributions for the PBS Utah major-gift prospecting capstone project.
 
 ## Contents
 
