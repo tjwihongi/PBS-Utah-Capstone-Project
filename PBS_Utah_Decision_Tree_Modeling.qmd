@@ -240,12 +240,18 @@ common_recipe <- recipe(baseline_formula, data = development_data) |>
   step_impute_median(all_numeric_predictors()) |>
   step_zv(all_predictors())
 
-model_metrics <- metric_set(pr_auc, roc_auc, brier_class, mn_log_loss)
+model_metrics <- metric_set(
+  average_precision,
+  pr_auc,
+  roc_auc,
+  brier_class,
+  mn_log_loss
+)
 resample_control <- control_resamples(save_pred = TRUE, verbose = FALSE)
 tune_control <- control_grid(save_pred = TRUE, verbose = FALSE)
 ```
 
-PR AUC is the primary selection metric because future major-donor transitions are rare. ROC AUC, Brier score, and log loss provide complementary information about discrimination and probability quality.
+Average precision is the primary selection metric because future major-donor transitions are rare and because it handles tied, constant scores more appropriately than trapezoidal PR AUC. PR AUC is retained as a diagnostic, while ROC AUC, Brier score, and log loss provide complementary information about discrimination and probability quality.
 
 ## Benchmark logistic regression
 
@@ -301,7 +307,10 @@ tree_runtime <- system.time({
     control = tune_control
   )
 })[["elapsed"]]
-best_tree_parameters <- select_best(tree_tuning_results, metric = "pr_auc")
+best_tree_parameters <- select_best(
+  tree_tuning_results,
+  metric = "average_precision"
+)
 best_tree_workflow <- finalize_workflow(tree_workflow, best_tree_parameters)
 best_tree_cv_metrics <- collect_metrics(tree_tuning_results) |>
   semi_join(best_tree_parameters, by = names(best_tree_parameters)) |>
@@ -309,7 +318,7 @@ best_tree_cv_metrics <- collect_metrics(tree_tuning_results) |>
 kable(
   best_tree_parameters,
   digits = 5,
-  caption = "Decision-tree parameters selected by development PR AUC"
+  caption = "Decision-tree parameters selected by development average precision"
 )
 ```
 
@@ -361,6 +370,20 @@ logistic_predictions <- collect_predictions(logistic_results)
 best_tree_config <- best_tree_cv_metrics$.config[1]
 tree_predictions <- collect_predictions(tree_tuning_results) |>
   filter(.config == best_tree_config)
+
+# A root-only tree can produce the same score for every constituent. In that
+# case, ROC AUC and top-K results are more informative than trapezoidal PR AUC.
+tree_prediction_check <- tree_predictions |>
+  group_by(id) |>
+  summarise(
+    distinct_predictions = n_distinct(.pred_major_donor),
+    minimum_probability = min(.pred_major_donor),
+    maximum_probability = max(.pred_major_donor),
+    prediction_sd = sd(.pred_major_donor),
+    outcome_prevalence = mean(major_donor_next_fy == "major_donor"),
+    .groups = "drop"
+  )
+
 top_k_results <- bind_rows(
   top_k_summary(logistic_predictions, "Logistic regression"),
   top_k_summary(tree_predictions, "Decision tree")
@@ -374,9 +397,15 @@ kable(
   caption = paste0("Performance among the top ", comma(500),
                    " scores in each fold")
 )
+
+kable(
+  tree_prediction_check,
+  digits = 6,
+  caption = "Decision-tree prediction variation by validation fold"
+)
 ```
 
-Top-$K$ precision and lift connect performance to the number of prospects PBS Utah can realistically review.
+Top-$K$ precision and lift connect performance to the number of prospects PBS Utah can realistically review. A fold with one distinct tree probability has no model-based ranking; its top-$K$ list is determined by tied row order and should not be interpreted as predictive performance.
 
 ## Runtime and in-sample performance
 
@@ -439,6 +468,13 @@ logistic_pr <- cv_comparison |>
 tree_pr <- cv_comparison |>
   filter(model == "Decision tree", .metric == "pr_auc") |>
   pull(mean)
+
+logistic_ap <- cv_comparison |>
+  filter(model == "Logistic regression", .metric == "average_precision") |>
+  pull(mean)
+tree_ap <- cv_comparison |>
+  filter(model == "Decision tree", .metric == "average_precision") |>
+  pull(mean)
 logistic_top_found <- top_k_results |>
   filter(model == "Logistic regression") |>
   summarise(total = sum(major_donors_found)) |>
@@ -447,11 +483,21 @@ tree_top_found <- top_k_results |>
   filter(model == "Decision tree") |>
   summarise(total = sum(major_donors_found)) |>
   pull(total)
+
+logistic_roc <- cv_comparison |>
+  filter(model == "Logistic regression", .metric == "roc_auc") |>
+  pull(mean)
+tree_roc <- cv_comparison |>
+  filter(model == "Decision tree", .metric == "roc_auc") |>
+  pull(mean)
+
+tree_has_ranking <- all(tree_prediction_check$distinct_predictions > 1)
+tree_is_root_only <- nrow(selected_rpart$frame) == 1
 ```
 
-The logistic benchmark achieved a mean chronological PR AUC of `r number(logistic_pr, accuracy = 0.001)`, compared with `r number(tree_pr, accuracy = 0.001)` for the tuned decision tree. `r if (tree_pr > logistic_pr) "The tree improved the primary development metric, suggesting that nonlinear splits and interactions added useful ranking information." else "The tree did not improve the primary development metric, so the simpler logistic benchmark is preferable."`
+The logistic benchmark achieved mean chronological average precision of `r number(logistic_ap, accuracy = 0.001)`, compared with `r number(tree_ap, accuracy = 0.001)` for the tuned decision tree. Logistic regression's mean ROC AUC was `r number(logistic_roc, accuracy = 0.001)`, compared with `r number(tree_roc, accuracy = 0.001)` for the tree. The trapezoidal PR AUC values were `r number(logistic_pr, accuracy = 0.001)` and `r number(tree_pr, accuracy = 0.001)`, respectively. `r if (!tree_has_ranking || tree_is_root_only) "The tree produced constant predictions and a root-only model. Its trapezoidal PR AUC is therefore a degenerate-curve artifact, not evidence of superior ranking performance." else if (tree_ap > logistic_ap) "The tree produced nonconstant rankings and improved average precision, providing evidence of useful nonlinear structure." else "The tree produced nonconstant rankings but did not improve average precision over logistic regression."`
 
-Across the development folds, the top `r comma(500)` logistic scores identified `r comma(logistic_top_found)` future major donors, while the tree identified `r comma(tree_top_found)`. These results are useful only if PBS Utah can review a similarly sized prospect list. The tree should advance to the group model only when its improvement is meaningful across folds and is not explained by substantially worse probability calibration or overfitting.
+Across the development folds, the top `r comma(500)` logistic scores identified `r comma(logistic_top_found)` future major donors, while the tree identified `r comma(tree_top_found)`. `r if (!tree_has_ranking) "Because the tree scores were tied, its top-500 lists were arbitrary and are not valid prospect rankings." else "These results are useful only if PBS Utah can review a similarly sized prospect list."` Logistic regression is therefore the more defensible benchmark unless a revised, chronologically validated tree produces nonconstant scores and a meaningful improvement across folds.
 
 Model scores should remain decision-support inputs. PBS Utah staff retain responsibility for prospect qualification, cultivation, contact decisions, and solicitation amounts. The FY2025-to-FY2026 period remains reserved for the group's one-time final evaluation and is not evaluated in this individual notebook.
 
